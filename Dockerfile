@@ -37,7 +37,7 @@ RUN groupadd -g 88 unbound && \
 
 COPY --from=builder /usr/local /usr/local
 
-RUN /usr/local/sbin/unbound-anchor -a /usr/local/etc/unbound/root.key || true
+RUN /usr/local/sbin/unbound-anchor -a /usr/local/etc/unbound/root.key || true && chown -R unbound:unbound /usr/local/etc/unbound
 
 EXPOSE 53/tcp 53/udp
 
