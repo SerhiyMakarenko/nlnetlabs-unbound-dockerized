@@ -17,7 +17,7 @@ RUN apt-get update && \
     cd unbound-${UNBOUND_VERSION} && \
     ./configure \
     	--disable-static && \
-    make && \
+    make -j3 && \
     make install
 
 FROM debian:10-slim
