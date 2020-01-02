@@ -1,6 +1,6 @@
 # The MIT License
 #
-# Copyright (c) 2019, Serhiy Makarenko
+# Copyright (c) 2020, Serhiy Makarenko
 
 FROM debian:10-slim AS builder
 
@@ -11,6 +11,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
     apt-get install -y --no-install-recommends --no-install-suggests \
     curl file libssl-dev libexpat1-dev build-essential ca-certificates && \
+    c_rehash && \
     curl -RL -O "https://nlnetlabs.nl/downloads/unbound/unbound-${UNBOUND_VERSION}.tar.gz" && \
     tar xvzf unbound-${UNBOUND_VERSION}.tar.gz && \
     cd unbound-${UNBOUND_VERSION} && \
@@ -20,7 +21,7 @@ RUN apt-get update && \
     make install
 
 FROM debian:10-slim
-LABEL maintainer="serhiy@makarenko.me"
+LABEL maintainer="serhiy.makarenko@me.com"
 
 ARG DEBIAN_FRONTEND=noninteractive
 
