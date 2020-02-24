@@ -4,7 +4,7 @@
 
 FROM debian:10-slim AS builder
 
-ARG UNBOUND_VERSION=1.9.6
+ARG UNBOUND_VERSION=1.10.0
 
 ARG DEBIAN_FRONTEND=noninteractive
 
