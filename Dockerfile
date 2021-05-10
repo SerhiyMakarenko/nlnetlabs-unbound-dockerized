@@ -1,10 +1,10 @@
 # The MIT License
 #
-# Copyright (c) 2020, Serhiy Makarenko
+# Copyright (c) 2021, Serhiy Makarenko
 
 FROM debian:10-slim AS builder
 
-ARG UNBOUND_VERSION=1.12.0
+ARG UNBOUND_VERSION=1.13.0
 
 ARG DEBIAN_FRONTEND=noninteractive
 
