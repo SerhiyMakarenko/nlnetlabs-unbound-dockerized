@@ -1,0 +1,160 @@
+name: Build image
+
+# Branch model: work lands on develop (test-only builds); merging develop
+# into stable is the release and publishes to Docker Hub.
+on:
+  push:
+    branches: [stable, develop]
+    paths: &build-paths
+      - Dockerfile
+      - docker-entrypoint.sh
+      - test/**
+      - .github/workflows/build.yml
+  pull_request:
+    paths: *build-paths
+  schedule:
+    # Monthly rebuild of stable with no cache, to pick up Debian security
+    # fixes (OpenSSL, expat) even when Unbound itself hasn't changed.
+    - cron: "23 5 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel a publish half-way; superseded test builds can go.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/stable' }}
+
+env:
+  IMAGE: docker.io/serhiymakarenko/nlnetlabs-unbound-resolver
+  PUBLISH: ${{ github.ref == 'refs/heads/stable' && github.event_name != 'pull_request' }}
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            slug: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm   # native arm64, free for public repos
+            slug: arm64
+          - platform: linux/arm/v7
+            runner: ubuntu-24.04       # no native 32-bit ARM runners: QEMU
+            slug: armv7
+            emulated: true
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.emulated && 90 || 30 }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        if: matrix.emulated
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          pull: true
+          no-cache: true
+          load: true
+          tags: unbound:test
+          labels: &labels |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Smoke test, current config layout
+        run: bash test/smoke-test.sh unbound:test test/unbound.conf ${{ matrix.platform }}
+
+      - name: Smoke test, legacy (2019-2021) config layout
+        run: bash test/smoke-test.sh unbound:test test/legacy.conf ${{ matrix.platform }}
+
+      - name: Log in to Docker Hub
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: serhiymakarenko
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Same builder, so every layer comes from the cache of the build that
+      # was just tested; this step only pushes it.
+      - name: Push by digest
+        id: push
+        if: env.PUBLISH == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: *labels
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        if: env.PUBLISH == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        if: env.PUBLISH == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.slug }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: publish multi-arch tags
+    needs: build
+    if: github.ref == 'refs/heads/stable' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download digests
+        uses: actions/download-artifact@v7
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: serhiymakarenko
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create manifest list and tags
+        run: |
+          version=$(sed -n 's/^ARG UNBOUND_VERSION=//p' Dockerfile)
+          minor=${version%.*}
+          stamp=$(date -u +%Y%m%d)
+
+          refs=()
+          for d in /tmp/digests/*; do refs+=("$IMAGE@sha256:$(basename "$d")"); done
+          [ "${#refs[@]}" -eq 3 ] || { echo "::error::expected 3 digests (amd64, arm64, arm/v7), got ${#refs[@]}"; exit 1; }
+
+          # latest / 1.26 / 1.26.0 move with each rebuild;
+          # 1.26.0-YYYYMMDD never changes, for rollbacks.
+          docker buildx imagetools create \
+            -t "$IMAGE:latest" \
+            -t "$IMAGE:$minor" \
+            -t "$IMAGE:$version" \
+            -t "$IMAGE:$version-$stamp" \
+            "${refs[@]}"
+
+          docker buildx imagetools inspect "$IMAGE:$version-$stamp"

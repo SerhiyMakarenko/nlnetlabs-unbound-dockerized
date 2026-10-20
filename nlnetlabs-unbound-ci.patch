@@ -1,0 +1,654 @@
+diff --git a/.github/dependabot.yml b/.github/dependabot.yml
+new file mode 100644
+index 0000000..904de95
+--- /dev/null
++++ b/.github/dependabot.yml
+@@ -0,0 +1,7 @@
++version: 2
++updates:
++  # Keeps actions/* and docker/* actions on current major versions.
++  - package-ecosystem: github-actions
++    directory: /
++    schedule:
++      interval: monthly
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+new file mode 100644
+index 0000000..7e9aaed
+--- /dev/null
++++ b/.github/workflows/build.yml
+@@ -0,0 +1,160 @@
++name: Build image
++
++# Branch model: work lands on develop (test-only builds); merging develop
++# into stable is the release and publishes to Docker Hub.
++on:
++  push:
++    branches: [stable, develop]
++    paths: &build-paths
++      - Dockerfile
++      - docker-entrypoint.sh
++      - test/**
++      - .github/workflows/build.yml
++  pull_request:
++    paths: *build-paths
++  schedule:
++    # Monthly rebuild of stable with no cache, to pick up Debian security
++    # fixes (OpenSSL, expat) even when Unbound itself hasn't changed.
++    - cron: "23 5 1 * *"
++  workflow_dispatch:
++
++permissions:
++  contents: read
++
++concurrency:
++  group: ${{ github.workflow }}-${{ github.ref }}
++  # Never cancel a publish half-way; superseded test builds can go.
++  cancel-in-progress: ${{ github.ref != 'refs/heads/stable' }}
++
++env:
++  IMAGE: docker.io/serhiymakarenko/nlnetlabs-unbound-resolver
++  PUBLISH: ${{ github.ref == 'refs/heads/stable' && github.event_name != 'pull_request' }}
++
++jobs:
++  build:
++    name: build (${{ matrix.platform }})
++    strategy:
++      fail-fast: true
++      matrix:
++        include:
++          - platform: linux/amd64
++            runner: ubuntu-24.04
++            slug: amd64
++          - platform: linux/arm64
++            runner: ubuntu-24.04-arm   # native arm64, free for public repos
++            slug: arm64
++          - platform: linux/arm/v7
++            runner: ubuntu-24.04       # no native 32-bit ARM runners: QEMU
++            slug: armv7
++            emulated: true
++    runs-on: ${{ matrix.runner }}
++    timeout-minutes: ${{ matrix.emulated && 90 || 30 }}
++    steps:
++      - uses: actions/checkout@v7
++
++      - name: Set up QEMU
++        if: matrix.emulated
++        uses: docker/setup-qemu-action@v4
++        with:
++          platforms: arm
++
++      - uses: docker/setup-buildx-action@v4
++
++      - name: Build
++        uses: docker/build-push-action@v7
++        with:
++          context: .
++          platforms: ${{ matrix.platform }}
++          pull: true
++          no-cache: true
++          load: true
++          tags: unbound:test
++          labels: &labels |
++            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
++            org.opencontainers.image.revision=${{ github.sha }}
++
++      - name: Smoke test, current config layout
++        run: bash test/smoke-test.sh unbound:test test/unbound.conf ${{ matrix.platform }}
++
++      - name: Smoke test, legacy (2019-2021) config layout
++        run: bash test/smoke-test.sh unbound:test test/legacy.conf ${{ matrix.platform }}
++
++      - name: Log in to Docker Hub
++        if: env.PUBLISH == 'true'
++        uses: docker/login-action@v4
++        with:
++          username: serhiymakarenko
++          password: ${{ secrets.DOCKERHUB_TOKEN }}
++
++      # Same builder, so every layer comes from the cache of the build that
++      # was just tested; this step only pushes it.
++      - name: Push by digest
++        id: push
++        if: env.PUBLISH == 'true'
++        uses: docker/build-push-action@v7
++        with:
++          context: .
++          platforms: ${{ matrix.platform }}
++          labels: *labels
++          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
++
++      - name: Export digest
++        if: env.PUBLISH == 'true'
++        env:
++          DIGEST: ${{ steps.push.outputs.digest }}
++        run: |
++          mkdir -p /tmp/digests
++          touch "/tmp/digests/${DIGEST#sha256:}"
++
++      - name: Upload digest
++        if: env.PUBLISH == 'true'
++        uses: actions/upload-artifact@v7
++        with:
++          name: digests-${{ matrix.slug }}
++          path: /tmp/digests/*
++          if-no-files-found: error
++          retention-days: 1
++
++  merge:
++    name: publish multi-arch tags
++    needs: build
++    if: github.ref == 'refs/heads/stable' && github.event_name != 'pull_request'
++    runs-on: ubuntu-24.04
++    steps:
++      - uses: actions/checkout@v7
++
++      - name: Download digests
++        uses: actions/download-artifact@v7
++        with:
++          path: /tmp/digests
++          pattern: digests-*
++          merge-multiple: true
++
++      - uses: docker/setup-buildx-action@v4
++
++      - name: Log in to Docker Hub
++        uses: docker/login-action@v4
++        with:
++          username: serhiymakarenko
++          password: ${{ secrets.DOCKERHUB_TOKEN }}
++
++      - name: Create manifest list and tags
++        run: |
++          version=$(sed -n 's/^ARG UNBOUND_VERSION=//p' Dockerfile)
++          minor=${version%.*}
++          stamp=$(date -u +%Y%m%d)
++
++          refs=()
++          for d in /tmp/digests/*; do refs+=("$IMAGE@sha256:$(basename "$d")"); done
++          [ "${#refs[@]}" -eq 3 ] || { echo "::error::expected 3 digests (amd64, arm64, arm/v7), got ${#refs[@]}"; exit 1; }
++
++          # latest / 1.26 / 1.26.0 move with each rebuild;
++          # 1.26.0-YYYYMMDD never changes, for rollbacks.
++          docker buildx imagetools create \
++            -t "$IMAGE:latest" \
++            -t "$IMAGE:$minor" \
++            -t "$IMAGE:$version" \
++            -t "$IMAGE:$version-$stamp" \
++            "${refs[@]}"
++
++          docker buildx imagetools inspect "$IMAGE:$version-$stamp"
+diff --git a/.github/workflows/unbound-release.yml b/.github/workflows/unbound-release.yml
+new file mode 100644
+index 0000000..cd10e18
+--- /dev/null
++++ b/.github/workflows/unbound-release.yml
+@@ -0,0 +1,133 @@
++name: Watch Unbound releases
++
++# Opens a PR against develop when NLnet Labs publishes a new Unbound
++# release. Merging that PR and then develop into stable publishes it.
++on:
++  schedule:
++    - cron: "41 6 * * 1"   # Mondays
++  workflow_dispatch:
++
++permissions:
++  contents: write         # push the update branch / keepalive commit
++  pull-requests: write    # open the PR
++  actions: write          # dispatch build.yml on the update branch
++
++concurrency:
++  group: ${{ github.workflow }}
++
++env:
++  DEV_BRANCH: develop
++  RELEASE_BRANCH: stable
++  # NLnet Labs releases signing key G2, used for releases since 2026-01-01.
++  # If NLnet Labs rolls this key, verification fails loudly; check
++  # https://nlnetlabs.nl/signing-keys and update both values.
++  NLNETLABS_KEY_URL: https://www.nlnetlabs.nl/downloads/keys/releases-g2.asc
++  NLNETLABS_KEY_FPR: 231018690C4D903EF419146AA144323DEAACDF45
++
++jobs:
++  watch:
++    runs-on: ubuntu-24.04
++    steps:
++      - uses: actions/checkout@v7
++        with:
++          ref: ${{ env.DEV_BRANCH }}
++          fetch-depth: 0   # also fetches stable, for the keepalive check
++
++      - name: Configure git
++        run: |
++          git config user.name "github-actions[bot]"
++          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
++
++      # GitHub disables cron triggers in public repos after 60 days without
++      # repository activity, which would silently stop the monthly rebuild
++      # and this watcher. If stable has been idle for 45 days, add an empty
++      # commit on top of it (without touching the develop checkout).
++      - name: Keep scheduled workflows enabled
++        if: github.ref == format('refs/heads/{0}', env.RELEASE_BRANCH)
++        run: |
++          tip="origin/$RELEASE_BRANCH"
++          age_days=$(( ( $(date +%s) - $(git log -1 --format=%ct "$tip") ) / 86400 ))
++          echo "Last commit on $RELEASE_BRANCH: ${age_days} days ago"
++          if [ "$age_days" -ge 45 ]; then
++            commit=$(git commit-tree "$tip^{tree}" -p "$tip" -m "chore: keep scheduled workflows enabled")
++            git push origin "$commit:refs/heads/$RELEASE_BRANCH"
++          fi
++
++      - name: Check for a newer release
++        id: check
++        env:
++          GH_TOKEN: ${{ github.token }}
++        run: |
++          current=$(sed -n 's/^ARG UNBOUND_VERSION=//p' Dockerfile)
++          current_sha=$(sed -n 's/^ARG UNBOUND_SHA256=//p' Dockerfile)
++          tag=$(gh api repos/NLnetLabs/unbound/releases/latest --jq .tag_name)
++          latest=${tag#release-}
++          echo "$DEV_BRANCH Dockerfile: ${current}  latest release: ${latest}"
++
++          [[ $latest =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::unexpected tag '$tag'"; exit 1; }
++
++          if [[ $latest == "$current" && $current_sha =~ ^[0-9a-f]{64}$ ]]; then
++            echo "Up to date."; echo "update=false" >> "$GITHUB_OUTPUT"; exit 0
++          fi
++          if [[ $(printf '%s\n' "$current" "$latest" | sort -V | tail -n1) != "$latest" ]]; then
++            echo "Dockerfile is ahead of the latest release; nothing to do."
++            echo "update=false" >> "$GITHUB_OUTPUT"; exit 0
++          fi
++          if git ls-remote --exit-code --heads origin "unbound-$latest" >/dev/null; then
++            echo "Branch unbound-$latest already exists; its PR is pending."
++            echo "update=false" >> "$GITHUB_OUTPUT"; exit 0
++          fi
++          echo "update=true" >> "$GITHUB_OUTPUT"
++          echo "version=$latest" >> "$GITHUB_OUTPUT"
++
++      - name: Download and verify the signed tarball
++        id: verify
++        if: steps.check.outputs.update == 'true'
++        env:
++          VERSION: ${{ steps.check.outputs.version }}
++        run: |
++          tarball="unbound-${VERSION}.tar.gz"
++          curl -fsSLO "https://nlnetlabs.nl/downloads/unbound/${tarball}"
++          curl -fsSLO "https://nlnetlabs.nl/downloads/unbound/${tarball}.asc"
++
++          GNUPGHOME=$(mktemp -d); export GNUPGHOME
++          curl -fsSL "$NLNETLABS_KEY_URL" | gpg --batch --quiet --import
++          gpg --batch --status-fd 1 --verify "${tarball}.asc" "$tarball" > /tmp/gpg-status
++
++          # Accept only a valid signature whose primary key is the pinned one,
++          # no matter which keys the downloaded key file happened to contain.
++          if ! grep -Eq "^\[GNUPG:\] VALIDSIG .* ${NLNETLABS_KEY_FPR}\$" /tmp/gpg-status; then
++            cat /tmp/gpg-status
++            echo "::error::${tarball} is not signed by key ${NLNETLABS_KEY_FPR}"
++            exit 1
++          fi
++          echo "sha256=$(sha256sum "$tarball" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
++          rm -f "$tarball" "${tarball}.asc"
++
++      - name: Open pull request against develop
++        if: steps.check.outputs.update == 'true'
++        env:
++          GH_TOKEN: ${{ github.token }}
++          VERSION: ${{ steps.check.outputs.version }}
++          SHA256: ${{ steps.verify.outputs.sha256 }}
++        run: |
++          branch="unbound-${VERSION}"
++          sed -i -e "s/^ARG UNBOUND_VERSION=.*/ARG UNBOUND_VERSION=${VERSION}/" \
++                 -e "s/^ARG UNBOUND_SHA256=.*/ARG UNBOUND_SHA256=${SHA256}/" Dockerfile
++          git switch -c "$branch"
++          git commit -am "Update Unbound to ${VERSION} version"
++          git push origin "$branch"
++
++          gh pr create --base "$DEV_BRANCH" --head "$branch" \
++            --title "Update Unbound to ${VERSION} version" \
++            --body "Release notes: https://github.com/NLnetLabs/unbound/releases/tag/release-${VERSION}
++
++          Tarball signature verified against NLnet Labs key \`${NLNETLABS_KEY_FPR}\`.
++          SHA-256: \`${SHA256}\`
++
++          The build check on this branch is test-only. Merge here, then merge
++          ${DEV_BRANCH} into ${RELEASE_BRANCH} to publish."
++
++          # PRs opened with GITHUB_TOKEN don't trigger pull_request workflows,
++          # so start the (test-only) build on the branch explicitly.
++          gh workflow run build.yml --ref "$branch"
+diff --git a/Dockerfile b/Dockerfile
+index 3ed0b00..8c7ccdd 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,46 +1,89 @@
++# syntax=docker/dockerfile:1
+ # The MIT License
+ #
+-# Copyright (c) 2021, Serhiy Makarenko
++# Copyright (c) 2019-2026, Serhiy Makarenko
+ 
+-FROM debian:10-slim AS builder
++ARG DEBIAN_RELEASE=trixie
++# Both lines are bumped by .github/workflows/unbound-release.yml, which
++# verifies the release's OpenPGP signature before recording the hash.
++ARG UNBOUND_VERSION=1.26.0
++ARG UNBOUND_SHA256=
+ 
+-ARG UNBOUND_VERSION=1.13.1
++# ------------------------------------------------------------------ source
++# Runs on the build host's own architecture, so fetching and verifying the
++# tarball never happens under emulation (the arm/v7 build runs in QEMU).
++FROM --platform=$BUILDPLATFORM debian:${DEBIAN_RELEASE}-slim AS source
+ 
++ARG UNBOUND_VERSION
++ARG UNBOUND_SHA256
+ ARG DEBIAN_FRONTEND=noninteractive
+ 
+ RUN apt-get update && \
+-    apt-get install -y --no-install-recommends --no-install-suggests \
+-    curl file libssl-dev libexpat1-dev build-essential ca-certificates && \
+-    c_rehash && \
+-    curl -RL -O "https://nlnetlabs.nl/downloads/unbound/unbound-${UNBOUND_VERSION}.tar.gz" && \
+-    tar xvzf unbound-${UNBOUND_VERSION}.tar.gz && \
+-    cd unbound-${UNBOUND_VERSION} && \
+-    ./configure \
+-    	--disable-static && \
+-    make -j3 && \
+-    make install
+-
+-FROM debian:10-slim
+-LABEL maintainer="serhiy.makarenko@me.com"
++    apt-get install -y --no-install-recommends ca-certificates curl && \
++    rm -rf /var/lib/apt/lists/*
++
++WORKDIR /src
++RUN test -n "${UNBOUND_SHA256}" || { echo "UNBOUND_SHA256 is required" >&2; exit 1; } && \
++    curl -fsSLO "https://nlnetlabs.nl/downloads/unbound/unbound-${UNBOUND_VERSION}.tar.gz" && \
++    echo "${UNBOUND_SHA256}  unbound-${UNBOUND_VERSION}.tar.gz" | sha256sum -c - && \
++    tar xzf "unbound-${UNBOUND_VERSION}.tar.gz" && \
++    mv "unbound-${UNBOUND_VERSION}" unbound
++
++# ----------------------------------------------------------------- builder
++FROM debian:${DEBIAN_RELEASE}-slim AS builder
++
++ARG DEBIAN_FRONTEND=noninteractive
++
++RUN apt-get update && \
++    apt-get install -y --no-install-recommends \
++      build-essential libexpat1-dev libssl-dev && \
++    rm -rf /var/lib/apt/lists/*
++
++COPY --from=source /src/unbound /src/unbound
++WORKDIR /src/unbound
++RUN ./configure \
++      --disable-static \
++      --with-rootkey-file=/var/lib/unbound/root.key && \
++    make -j"$(nproc)" && \
++    make install DESTDIR=/out
+ 
++# ----------------------------------------------------------------- runtime
++FROM debian:${DEBIAN_RELEASE}-slim
++
++ARG UNBOUND_VERSION
+ ARG DEBIAN_FRONTEND=noninteractive
+ 
+-ENV LD_LIBRARY_PATH=/usr/local/lib
++LABEL maintainer="serhiy.makarenko@me.com" \
++      org.opencontainers.image.title="nlnetlabs-unbound-resolver" \
++      org.opencontainers.image.version="${UNBOUND_VERSION}" \
++      org.opencontainers.image.licenses="MIT"
+ 
+ RUN apt-get update && \
+-    apt-get install -y --no-install-recommends --no-install-suggests \
+-    libssl1.1 libexpat1 && \
++    apt-get install -y --no-install-recommends libssl3t64 libexpat1 && \
+     rm -rf /var/lib/apt/lists/*
+ 
++# Same UID/GID 88 as the 2019-2021 image, so host file ownership still works.
+ RUN groupadd -g 88 unbound && \
+-	useradd -c "Unbound DNS resolver" -d /usr/local/etc/unbound -u 88 \
+-        -g unbound -s /bin/false unbound
++    useradd -r -u 88 -g unbound -d /var/lib/unbound -s /usr/sbin/nologin \
++      -c "Unbound DNS resolver" unbound
++
++COPY --from=builder /out/usr/local/ /usr/local/
++
++# /usr/local/lib is already in Debian's ld.so.conf, so no LD_LIBRARY_PATH.
++# /usr/local/etc/unbound (the default chroot) stays owned by unbound, as in
++# the old image, so legacy configs that keep root.key there still work.
++RUN ldconfig && \
++    install -d -o unbound -g unbound -m 0755 /var/lib/unbound && \
++    chown unbound:unbound /usr/local/etc/unbound
+ 
+-COPY --from=builder /usr/local /usr/local
++COPY --chmod=0755 docker-entrypoint.sh /usr/local/sbin/docker-entrypoint.sh
+ 
+-RUN /usr/local/sbin/unbound-anchor -a /usr/local/etc/unbound/root.key || true && chown -R unbound:unbound /usr/local/etc/unbound
++# Home of the trust anchor in the current config layout. It is runtime
++# state: it must survive container recreation and stay writable so that
++# RFC 5011 can follow root key rollovers.
++VOLUME ["/var/lib/unbound"]
+ 
+ EXPOSE 53/tcp 53/udp
+ 
+-ENTRYPOINT ["/usr/local/sbin/unbound"]
+-CMD ["-d", "-c", "/usr/local/etc/unbound/unbound.conf"]
++ENTRYPOINT ["/usr/local/sbin/docker-entrypoint.sh"]
++CMD ["-d", "-p", "-c", "/usr/local/etc/unbound/unbound.conf"]
+diff --git a/README.md b/README.md
+index 9779f8a..e77d6c3 100644
+--- a/README.md
++++ b/README.md
+@@ -1,12 +1,59 @@
+ # General
+-[![MIT License](https://img.shields.io/badge/License-MIT-blue.svg?style=flat)](https://github.com/SerhiyMakarenko/nlnetlabs-unbound-dockerized/blob/nlnetlabs-unbound-resolver/stable/LICENSE)
++[![Build image](https://github.com/SerhiyMakarenko/nlnetlabs-unbound-dockerized/actions/workflows/build.yml/badge.svg?branch=stable)](https://github.com/SerhiyMakarenko/nlnetlabs-unbound-dockerized/actions/workflows/build.yml)
++[![MIT License](https://img.shields.io/badge/License-MIT-blue.svg?style=flat)](https://github.com/SerhiyMakarenko/nlnetlabs-unbound-dockerized/blob/stable/LICENSE)
+ 
+ Unbound is a validating, recursive, caching DNS resolver. It is designed to be fast and lean and incorporates modern features based on open standards.
+ 
++This image builds Unbound from NLnet Labs' signed source releases on Debian 13 (trixie) for `linux/amd64`, `linux/arm64` and `linux/arm/v7`.
++
++# Tags
++| Tag | Meaning |
++|---|---|
++| `latest` | Newest Unbound release, rebuilt monthly with current Debian security fixes |
++| `1.26`, `1.26.0` | Newest build of that Unbound minor / patch version |
++| `1.26.0-YYYYMMDD` | One specific build that never changes; pin this to roll back |
++
+ # Usage
+-To run container you need to execute command listed below:
+ ```
+ docker run -d --name nlnetlabs-unbound-resolver --net=host \
+-    -v /path/to/unbound.conf:/usr/local/etc/unbound/unbound.conf \
++    -v /path/to/unbound.conf:/usr/local/etc/unbound/unbound.conf:ro \
++    -v unbound-anchor:/var/lib/unbound \
+     serhiymakarenko/nlnetlabs-unbound-resolver:latest
+-```
+\ No newline at end of file
++```
++
++Or with Docker Compose:
++```yaml
++services:
++  unbound:
++    image: serhiymakarenko/nlnetlabs-unbound-resolver:latest
++    container_name: nlnetlabs-unbound-resolver
++    network_mode: host
++    restart: unless-stopped
++    volumes:
++      - ./unbound.conf:/usr/local/etc/unbound/unbound.conf:ro
++      - unbound-anchor:/var/lib/unbound
++
++volumes:
++  unbound-anchor:
++```
++
++For DNSSEC validation, `unbound.conf` needs:
++```
++server:
++    chroot: ""
++    auto-trust-anchor-file: "/var/lib/unbound/root.key"
++```
++
++On every start, the entrypoint reads `auto-trust-anchor-file` from your config, then creates or repairs that trust anchor with `unbound-anchor` before starting Unbound. Keeping `/var/lib/unbound` on a volume lets Unbound follow DNS root key rollovers (RFC 5011) across container restarts and recreation.
++
++# Upgrading from the 2019-2021 image (Unbound 1.13.1 and older)
++The old image baked a root trust anchor into the image at build time, so it was reset to a 2021 copy every time the container was recreated. That copy only has the root key KSK-2017. Since the root zone switched to KSK-2024 on 11 October 2026, that copy can no longer validate anything, so DNSSEC-validating setups on the old image fail every lookup with SERVFAIL.
++
++Existing configs keep working unchanged: if yours keeps `root.key` at `/usr/local/etc/unbound/root.key` inside the default chroot, the entrypoint repairs the anchor there on every start. Moving to the layout above is still recommended, because it keeps the anchor across container recreation.
++
++Other changes: Debian 10 → 13, OpenSSL 1.1.1 → 3.x, no `LD_LIBRARY_PATH`, no pidfile in the default command (`-p`). The `unbound` user is still UID/GID 88.
++
++# How the image is maintained
++- **Every build is tested before it is published.** CI starts the image with both config layouts and requires that a signed zone validates (AD flag), that a deliberately broken zone is rejected (SERVFAIL), and that the broken zone resolves with checking disabled (`+cd`), so the rejection is shown to come from validation.
++- **New Unbound releases are picked up weekly.** A workflow checks for new releases and verifies the tarball's OpenPGP signature against NLnet Labs' pinned release key. It then opens a PR against `develop` with the new version and SHA-256.
++- **Merging `develop` into `stable` publishes.** `stable` is also rebuilt without cache on the 1st of every month.
+diff --git a/docker-entrypoint.sh b/docker-entrypoint.sh
+new file mode 100755
+index 0000000..947ca0b
+--- /dev/null
++++ b/docker-entrypoint.sh
+@@ -0,0 +1,53 @@
++#!/bin/sh
++# Keeps the root trust anchor valid before Unbound starts, at whatever path
++# the mounted config names, so both config layouts work:
++#
++#   current: chroot: "" + auto-trust-anchor-file: "/var/lib/unbound/root.key"
++#            with /var/lib/unbound on a volume (survives container recreation)
++#   legacy:  default chroot + auto-trust-anchor-file:
++#            "/usr/local/etc/unbound/root.key" (configs written for the
++#            2019-2021 image keep working unchanged)
++set -eu
++
++SBIN=/usr/local/sbin
++
++# Config file: the argument after -c, else the default used in CMD.
++CONF=/usr/local/etc/unbound/unbound.conf
++prev=
++for arg in "$@"; do
++    if [ "$prev" = "-c" ]; then CONF=$arg; fi
++    prev=$arg
++done
++
++anchor=$("$SBIN/unbound-checkconf" -o auto-trust-anchor-file "$CONF" 2>/dev/null || true)
++
++if [ -z "$anchor" ]; then
++    echo "entrypoint: no auto-trust-anchor-file in $CONF, not managing a trust anchor" >&2
++else
++    case $anchor in
++        /*) ;;
++        *) anchor="$("$SBIN/unbound-checkconf" -o directory "$CONF")/$anchor" ;;
++    esac
++    dir=$(dirname "$anchor")
++    mkdir -p "$dir"
++
++    # Bootstrap a missing anchor, or repair one that missed a root KSK
++    # rollover: unbound-anchor tries RFC 5011 over DNS first and, if the
++    # stored anchor can no longer validate the root, rebuilds it from IANA's
++    # root-anchors.xml verified against ICANN's certificate. Exit code 1
++    # means "anchor was rebuilt" and is expected, so it is ignored.
++    "$SBIN/unbound-anchor" -a "$anchor" || true
++
++    if [ ! -s "$anchor" ]; then
++        echo "entrypoint: FATAL: no root trust anchor at $anchor" >&2
++        exit 1
++    fi
++
++    # The daemon drops to user unbound and rewrites the anchor through a temp
++    # file + rename in the same directory, so it needs to own both.
++    chown unbound:unbound "$dir" "$anchor" 2>/dev/null ||
++        echo "entrypoint: WARNING: cannot give $anchor to user unbound; RFC 5011 updates will fail" >&2
++    echo "entrypoint: trust anchor ready at $anchor" >&2
++fi
++
++exec "$SBIN/unbound" "$@"
+diff --git a/test/legacy.conf b/test/legacy.conf
+new file mode 100644
+index 0000000..371f69e
+--- /dev/null
++++ b/test/legacy.conf
+@@ -0,0 +1,9 @@
++# Shaped like configs written for the 2019-2021 image: default chroot
++# (/usr/local/etc/unbound) with the trust anchor inside it. Guards backward
++# compatibility for existing users of the :latest tag.
++server:
++    interface: 0.0.0.0
++    access-control: 0.0.0.0/0 allow
++    do-ip6: no
++    auto-trust-anchor-file: "/usr/local/etc/unbound/root.key"
++    verbosity: 1
+diff --git a/test/smoke-test.sh b/test/smoke-test.sh
+new file mode 100755
+index 0000000..c0d3b59
+--- /dev/null
++++ b/test/smoke-test.sh
+@@ -0,0 +1,54 @@
++#!/usr/bin/env bash
++# End-to-end check that the image resolves AND validates DNSSEC:
++# a signed zone must come back with the AD flag, a deliberately broken
++# zone must be SERVFAIL, and the same broken zone must resolve with +cd
++# (which proves the SERVFAIL comes from validation, not from the network).
++#
++# usage: smoke-test.sh IMAGE CONFIG [PLATFORM]
++set -euo pipefail
++
++IMAGE=${1:?usage: smoke-test.sh IMAGE CONFIG [PLATFORM]}
++CONFIG=$(realpath "${2:?usage: smoke-test.sh IMAGE CONFIG [PLATFORM]}")
++PLATFORM=${3:-}
++NAME="unbound-smoke-$$"
++PORT=5053
++
++if ! command -v dig >/dev/null; then
++  sudo apt-get update -qq && sudo apt-get install -y -qq bind9-dnsutils >/dev/null
++fi
++
++cleanup() {
++  local rc=$?
++  if [ "$rc" -ne 0 ]; then
++    echo "--- unbound log ---"
++    docker logs "$NAME" 2>&1 | tail -n 100 || true
++  fi
++  docker rm -f "$NAME" >/dev/null 2>&1 || true
++  exit "$rc"
++}
++trap cleanup EXIT
++
++run_args=(-d --name "$NAME"
++  -p "127.0.0.1:${PORT}:53/udp" -p "127.0.0.1:${PORT}:53/tcp"
++  -v "${CONFIG}:/usr/local/etc/unbound/unbound.conf:ro")
++[ -n "$PLATFORM" ] && run_args+=(--platform "$PLATFORM")
++docker run "${run_args[@]}" "$IMAGE" >/dev/null
++
++q()      { dig @127.0.0.1 -p "$PORT" +time=5 +tries=2 "$@" 2>&1 || true; }
++status() { q "$@" | sed -n 's/.*status: \([A-Z]*\),.*/\1/p'; }
++has_ad() { local out; out=$(q +dnssec "$@"); grep -Eq '^;; flags:[a-z ]* ad[ ;]' <<<"$out"; }
++fail()   { echo "FAIL: $*" >&2; exit 1; }
++
++echo "Testing $(basename "$CONFIG")${PLATFORM:+ on $PLATFORM}; waiting for the trust anchor to prime..."
++for _ in $(seq 1 60); do   # generous: the arm/v7 run is emulated
++  has_ad . SOA && break
++  sleep 2
++done
++
++has_ad . SOA                                     || fail "root not validated: trust anchor did not prime"
++has_ad nlnetlabs.nl A                            || fail "signed zone returned without the AD flag"
++[ "$(status dnssec-failed.org A)" = SERVFAIL ]    || fail "deliberately broken zone was not rejected"
++[ "$(status +cd dnssec-failed.org A)" = NOERROR ] || fail "broken zone unreachable even with +cd (network?)"
++
++echo "PASS: resolution and DNSSEC validation work"
++docker logs "$NAME" 2>&1 | grep -E -m2 'entrypoint: trust anchor|keytag query' || true
+diff --git a/test/unbound.conf b/test/unbound.conf
+new file mode 100644
+index 0000000..9b15187
+--- /dev/null
++++ b/test/unbound.conf
+@@ -0,0 +1,8 @@
++# Current layout, as recommended in the README. Used by test/smoke-test.sh.
++server:
++    interface: 0.0.0.0
++    access-control: 0.0.0.0/0 allow   # the test publishes the port on 127.0.0.1 only
++    do-ip6: no                          # GitHub-hosted runners have no IPv6
++    chroot: ""
++    auto-trust-anchor-file: "/var/lib/unbound/root.key"
++    verbosity: 1
