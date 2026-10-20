@@ -1,0 +1,133 @@
+name: Watch Unbound releases
+
+# Opens a PR against develop when NLnet Labs publishes a new Unbound
+# release. Merging that PR and then develop into stable publishes it.
+on:
+  schedule:
+    - cron: "41 6 * * 1"   # Mondays
+  workflow_dispatch:
+
+permissions:
+  contents: write         # push the update branch / keepalive commit
+  pull-requests: write    # open the PR
+  actions: write          # dispatch build.yml on the update branch
+
+concurrency:
+  group: ${{ github.workflow }}
+
+env:
+  DEV_BRANCH: develop
+  RELEASE_BRANCH: stable
+  # NLnet Labs releases signing key G2, used for releases since 2026-01-01.
+  # If NLnet Labs rolls this key, verification fails loudly; check
+  # https://nlnetlabs.nl/signing-keys and update both values.
+  NLNETLABS_KEY_URL: https://www.nlnetlabs.nl/downloads/keys/releases-g2.asc
+  NLNETLABS_KEY_FPR: 231018690C4D903EF419146AA144323DEAACDF45
+
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.DEV_BRANCH }}
+          fetch-depth: 0   # also fetches stable, for the keepalive check
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # GitHub disables cron triggers in public repos after 60 days without
+      # repository activity, which would silently stop the monthly rebuild
+      # and this watcher. If stable has been idle for 45 days, add an empty
+      # commit on top of it (without touching the develop checkout).
+      - name: Keep scheduled workflows enabled
+        if: github.ref == format('refs/heads/{0}', env.RELEASE_BRANCH)
+        run: |
+          tip="origin/$RELEASE_BRANCH"
+          age_days=$(( ( $(date +%s) - $(git log -1 --format=%ct "$tip") ) / 86400 ))
+          echo "Last commit on $RELEASE_BRANCH: ${age_days} days ago"
+          if [ "$age_days" -ge 45 ]; then
+            commit=$(git commit-tree "$tip^{tree}" -p "$tip" -m "chore: keep scheduled workflows enabled")
+            git push origin "$commit:refs/heads/$RELEASE_BRANCH"
+          fi
+
+      - name: Check for a newer release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current=$(sed -n 's/^ARG UNBOUND_VERSION=//p' Dockerfile)
+          current_sha=$(sed -n 's/^ARG UNBOUND_SHA256=//p' Dockerfile)
+          tag=$(gh api repos/NLnetLabs/unbound/releases/latest --jq .tag_name)
+          latest=${tag#release-}
+          echo "$DEV_BRANCH Dockerfile: ${current}  latest release: ${latest}"
+
+          [[ $latest =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::unexpected tag '$tag'"; exit 1; }
+
+          if [[ $latest == "$current" && $current_sha =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Up to date."; echo "update=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [[ $(printf '%s\n' "$current" "$latest" | sort -V | tail -n1) != "$latest" ]]; then
+            echo "Dockerfile is ahead of the latest release; nothing to do."
+            echo "update=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git ls-remote --exit-code --heads origin "unbound-$latest" >/dev/null; then
+            echo "Branch unbound-$latest already exists; its PR is pending."
+            echo "update=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "update=true" >> "$GITHUB_OUTPUT"
+          echo "version=$latest" >> "$GITHUB_OUTPUT"
+
+      - name: Download and verify the signed tarball
+        id: verify
+        if: steps.check.outputs.update == 'true'
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          tarball="unbound-${VERSION}.tar.gz"
+          curl -fsSLO "https://nlnetlabs.nl/downloads/unbound/${tarball}"
+          curl -fsSLO "https://nlnetlabs.nl/downloads/unbound/${tarball}.asc"
+
+          GNUPGHOME=$(mktemp -d); export GNUPGHOME
+          curl -fsSL "$NLNETLABS_KEY_URL" | gpg --batch --quiet --import
+          gpg --batch --status-fd 1 --verify "${tarball}.asc" "$tarball" > /tmp/gpg-status
+
+          # Accept only a valid signature whose primary key is the pinned one,
+          # no matter which keys the downloaded key file happened to contain.
+          if ! grep -Eq "^\[GNUPG:\] VALIDSIG .* ${NLNETLABS_KEY_FPR}\$" /tmp/gpg-status; then
+            cat /tmp/gpg-status
+            echo "::error::${tarball} is not signed by key ${NLNETLABS_KEY_FPR}"
+            exit 1
+          fi
+          echo "sha256=$(sha256sum "$tarball" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          rm -f "$tarball" "${tarball}.asc"
+
+      - name: Open pull request against develop
+        if: steps.check.outputs.update == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.check.outputs.version }}
+          SHA256: ${{ steps.verify.outputs.sha256 }}
+        run: |
+          branch="unbound-${VERSION}"
+          sed -i -e "s/^ARG UNBOUND_VERSION=.*/ARG UNBOUND_VERSION=${VERSION}/" \
+                 -e "s/^ARG UNBOUND_SHA256=.*/ARG UNBOUND_SHA256=${SHA256}/" Dockerfile
+          git switch -c "$branch"
+          git commit -am "Update Unbound to ${VERSION} version"
+          git push origin "$branch"
+
+          gh pr create --base "$DEV_BRANCH" --head "$branch" \
+            --title "Update Unbound to ${VERSION} version" \
+            --body "Release notes: https://github.com/NLnetLabs/unbound/releases/tag/release-${VERSION}
+
+          Tarball signature verified against NLnet Labs key \`${NLNETLABS_KEY_FPR}\`.
+          SHA-256: \`${SHA256}\`
+
+          The build check on this branch is test-only. Merge here, then merge
+          ${DEV_BRANCH} into ${RELEASE_BRANCH} to publish."
+
+          # PRs opened with GITHUB_TOKEN don't trigger pull_request workflows,
+          # so start the (test-only) build on the branch explicitly.
+          gh workflow run build.yml --ref "$branch"

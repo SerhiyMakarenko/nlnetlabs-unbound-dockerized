@@ -1,0 +1,7 @@
+version: 2
+updates:
+  # Keeps actions/* and docker/* actions on current major versions.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
