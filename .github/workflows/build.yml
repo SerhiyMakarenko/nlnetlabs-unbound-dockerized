@@ -63,32 +63,23 @@ jobs:
           fi
 
   build:
-    name: build (${{ matrix.platform }})
     needs: dedupe
-    # dedupe is skipped for every event except a push to develop; run
+    # dedupe only runs for pull requests and pushes to develop; build
     # regardless, unless it found an identical tree that already passed.
     if: ${{ !cancelled() && needs.dedupe.outputs.tested != 'true' }}
     strategy:
       fail-fast: true
       matrix:
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-24.04
-            slug: amd64
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm   # native arm64, free for public repos
-            slug: arm64
-          - platform: linux/arm/v7
-            runner: ubuntu-24.04       # no native 32-bit ARM runners: QEMU
-            slug: armv7
-            emulated: true
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.emulated && 90 || 30 }}
+        platform: [linux/amd64, linux/arm64, linux/arm/v7]
+    # arm64 builds natively (free for public repos). There are no native
+    # 32-bit ARM runners, so arm/v7 builds on amd64 under QEMU.
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: ${{ matrix.platform == 'linux/arm/v7' && 90 || 30 }
     steps:
       - uses: actions/checkout@v7
 
       - name: Set up QEMU
-        if: matrix.emulated
+        if: matrix.platform == 'linux/arm/v7'
         uses: docker/setup-qemu-action@v4
         with:
           platforms: arm
@@ -145,7 +136,7 @@ jobs:
         if: env.PUBLISH == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: digests-${{ matrix.slug }}
+          name: digests-${{ strategy.job-index }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
