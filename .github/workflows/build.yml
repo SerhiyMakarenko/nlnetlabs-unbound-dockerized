@@ -31,8 +31,37 @@ env:
   PUBLISH: ${{ github.ref == 'refs/heads/stable' && github.event_name != 'pull_request' }}
 
 jobs:
+  # A push to develop that only lands a PR whose exact content (same git
+  # tree) already passed CI gets no second build. Direct pushes to develop,
+  # and anything that differs from what was tested, still build.
+  dedupe:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+    outputs:
+      tested: ${{ steps.check.outputs.tested }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TREE: ${{ github.event.head_commit.tree_id }}
+        run: |
+          url=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs?status=success&per_page=50" \
+                --jq "[.workflow_runs[] | select(.head_commit.tree_id == \"$TREE\")] | first | .html_url // empty")
+          if [ -n "$url" ]; then
+            echo "::notice::Tree $TREE already passed CI in $url; skipping the rebuild."
+            echo "tested=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tested=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: build (${{ matrix.platform }})
+    needs: dedupe
+    # dedupe is skipped for every event except a push to develop; run
+    # regardless, unless it found an identical tree that already passed.
+    if: ${{ !cancelled() && needs.dedupe.outputs.tested != 'true' }}
     strategy:
       fail-fast: true
       matrix:
@@ -118,7 +147,9 @@ jobs:
   merge:
     name: publish multi-arch tags
     needs: build
-    if: github.ref == 'refs/heads/stable' && github.event_name != 'pull_request'
+    # Explicit result check: with a skipped dedupe upstream, the implicit
+    # success() would skip this job even after a good build.
+    if: ${{ !cancelled() && needs.build.result == 'success' && github.ref == 'refs/heads/stable' && github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7

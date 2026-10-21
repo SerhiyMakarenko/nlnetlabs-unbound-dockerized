@@ -10,7 +10,6 @@ on:
 permissions:
   contents: write         # push the update branch / keepalive commit
   pull-requests: write    # open the PR
-  actions: write          # dispatch build.yml on the update branch
 
 concurrency:
   group: ${{ github.workflow }}
@@ -125,9 +124,7 @@ jobs:
           Tarball signature verified against NLnet Labs key \`${NLNETLABS_KEY_FPR}\`.
           SHA-256: \`${SHA256}\`
 
-          The build check on this branch is test-only. Merge here, then merge
+          GitHub holds CI on bot-created PRs until a maintainer approves it:
+          check that only the two ARG lines in the Dockerfile changed, then
+          use Approve and run. The build here is test-only; merge, then merge
           ${DEV_BRANCH} into ${RELEASE_BRANCH} to publish."
-
-          # PRs opened with GITHUB_TOKEN don't trigger pull_request workflows,
-          # so start the (test-only) build on the branch explicitly.
-          gh workflow run build.yml --ref "$branch"
