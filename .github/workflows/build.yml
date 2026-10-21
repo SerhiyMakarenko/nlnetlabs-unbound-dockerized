@@ -157,6 +157,8 @@ jobs:
     # success() would skip this job even after a good build.
     if: ${{ !cancelled() && needs.build.result == 'success' && github.ref == 'refs/heads/stable' && github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # push the vX.Y.Z tag and create the GitHub Release
     steps:
       - uses: actions/checkout@v7
 
@@ -176,6 +178,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Create manifest list and tags
+        id: publish
         run: |
           version=$(sed -n 's/^ARG UNBOUND_VERSION=//p' Dockerfile)
           minor=${version%.*}
@@ -195,3 +198,61 @@ jobs:
             "${refs[@]}"
 
           docker buildx imagetools inspect "$IMAGE:$version-$stamp"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "stamp=$stamp" >> "$GITHUB_OUTPUT"
+
+      # One tag + GitHub Release per Unbound version (v1.26.1, ...), as in the
+      # repo's history: created on the stable commit that first published it,
+      # and only after the images are on Docker Hub. Monthly rebuilds of the
+      # same version find the release and leave it alone. Checking for the
+      # release (not the tag) lets a later run finish a half-done release.
+      - name: Tag and create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.publish.outputs.version }}
+          STAMP: ${{ steps.publish.outputs.stamp }}
+        run: |
+          tag="v${VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; this run was a rebuild."
+            exit 0
+          fi
+
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" -m "Unbound ${VERSION}" "$GITHUB_SHA"
+            git push origin "refs/tags/$tag"
+          fi
+
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION-$STAMP" --format '{{.Manifest.Digest}}' 2>/dev/null || true)
+          repo_name=${GITHUB_REPOSITORY#*/}
+
+          cat > /tmp/notes.md <<'EOF'
+          Unbound @VERSION@ built from NLnet Labs' signed source release ([upstream release notes](https://github.com/NLnetLabs/unbound/releases/tag/release-@VERSION@)).
+
+          ### Docker image
+          Platforms: `linux/amd64`, `linux/arm64`, `linux/arm/v7`
+          ```
+          docker pull serhiymakarenko/nlnetlabs-unbound-resolver:@VERSION@
+          ```
+          The tags `@VERSION@` and `latest` move with the monthly rebuilds. `@VERSION@-@STAMP@` is this exact build and never changes.@DIGEST_LINE@
+
+          ### Build it yourself
+          ```
+          git clone --branch v@VERSION@ https://github.com/@REPO@.git
+          cd @REPO_NAME@
+          docker build -t nlnetlabs-unbound-resolver .
+          ```
+          The Dockerfile pins the source tarball by SHA-256. That hash was recorded only after the tarball's OpenPGP signature verified against NLnet Labs' release key.
+          EOF
+
+          digest_line=""
+          [ -n "$digest" ] && digest_line=" Manifest digest: \`${digest}\`."
+          sed -i -e "s|@VERSION@|${VERSION}|g" -e "s|@STAMP@|${STAMP}|g" \
+                 -e "s|@REPO@|${GITHUB_REPOSITORY}|g" -e "s|@REPO_NAME@|${repo_name}|g" \
+                 -e "s|@DIGEST_LINE@|${digest_line}|" /tmp/notes.md
+
+          # --notes is prepended to the notes GitHub generates from merged PRs.
+          gh release create "$tag" --verify-tag --title "Unbound ${VERSION}" \
+            --notes "$(cat /tmp/notes.md)" --generate-notes
