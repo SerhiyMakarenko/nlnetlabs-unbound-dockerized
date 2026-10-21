@@ -31,22 +31,28 @@ env:
   PUBLISH: ${{ github.ref == 'refs/heads/stable' && github.event_name != 'pull_request' }}
 
 jobs:
-  # A push to develop that only lands a PR whose exact content (same git
-  # tree) already passed CI gets no second build. Direct pushes to develop,
-  # and anything that differs from what was tested, still build.
+  # Skip test-only runs whose exact content (same git tree) already passed:
+  # the push to develop after merging a tested PR, and a develop -> stable
+  # PR whose merge result equals what develop already tested. Never applies
+  # to pushes to stable or the monthly rebuild: those publish, so they always
+  # build and test the image they push.
   dedupe:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/develop')
     runs-on: ubuntu-24.04
     permissions:
       actions: read
+      contents: read
     outputs:
       tested: ${{ steps.check.outputs.tested }}
     steps:
+      # For a PR this is the merge result GitHub would test, not the PR head.
+      - uses: actions/checkout@v7
+
       - id: check
         env:
           GH_TOKEN: ${{ github.token }}
-          TREE: ${{ github.event.head_commit.tree_id }}
         run: |
+          TREE=$(git rev-parse 'HEAD^{tree}')
           url=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs?status=success&per_page=50" \
                 --jq "[.workflow_runs[] | select(.head_commit.tree_id == \"$TREE\")] | first | .html_url // empty")
           if [ -n "$url" ]; then

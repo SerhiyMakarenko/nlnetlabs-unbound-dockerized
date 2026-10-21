@@ -3,5 +3,6 @@ updates:
   # Keeps actions/* and docker/* actions on current major versions.
   - package-ecosystem: github-actions
     directory: /
+    target-branch: develop
     schedule:
       interval: monthly
