@@ -6,8 +6,8 @@
 ARG DEBIAN_RELEASE=trixie
 # Both lines are bumped by .github/workflows/unbound-release.yml, which
 # verifies the release's OpenPGP signature before recording the hash.
-ARG UNBOUND_VERSION=1.26.0
-ARG UNBOUND_SHA256=
+ARG UNBOUND_VERSION=1.26.1
+ARG UNBOUND_SHA256=35a6dc0e425a9282c3426d9a3043144011bf0534aed4b73ab62c52aee0af1503
 
 # ------------------------------------------------------------------ source
 # Runs on the build host's own architecture, so fetching and verifying the
