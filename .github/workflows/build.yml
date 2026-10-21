@@ -74,7 +74,7 @@ jobs:
     # arm64 builds natively (free for public repos). There are no native
     # 32-bit ARM runners, so arm/v7 builds on amd64 under QEMU.
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
-    timeout-minutes: ${{ matrix.platform == 'linux/arm/v7' && 90 || 30 }
+    timeout-minutes: ${{ matrix.platform == 'linux/arm/v7' && 90 || 30 }}
     steps:
       - uses: actions/checkout@v7
 
